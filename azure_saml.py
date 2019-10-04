@@ -9,8 +9,12 @@ import boto3
 import keyring
 import argparse
 import logging
+import urllib
+import webbrowser
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from xml.etree import ElementTree as ET
+import ssl
 
 logger = logging.getLogger("aadlogin")
 handler = logging.StreamHandler(sys.stdout)
@@ -18,6 +22,54 @@ FORMAT = "[%(asctime)s][%(levelname)s] %(message)s"
 handler.setFormatter(logging.Formatter(FORMAT))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# Python 3 compatibility (python 3 has urlencode in parse sub-module)
+URLENCODE = getattr(urllib, 'parse', urllib).urlencode
+# Python 3 compatibility (python 3 has urlopen in parse sub-module)
+URLOPEN = getattr(urllib, 'request', urllib).urlopen
+
+def is_url(string: str) -> bool:
+    return urlparse(string).scheme != ''
+
+
+def get_console_url(credentials: dict = None, destination: str = None):
+    amazon_domain = 'amazonaws-us-gov' if 'gov' in str(credentials.get('Region')) else 'aws.amazon'
+    logger.debug('Amazon domain: %s', amazon_domain)
+    credentials = credentials if credentials is not None else {}
+    logger.debug('Credentials: {}'.format(json.dumps(credentials, default=str, indent=2)))
+    params = {
+        'Action': 'getSigninToken',
+        'Session': {
+            'sessionId': credentials.get('AccessKeyId'),
+            'sessionKey': credentials.get('SecretAccessKey'),
+            'sessionToken': credentials.get('SessionToken'),
+        },
+    }
+    
+    logger.debug('Get console url request params: {}'.format(json.dumps(params, default=str, indent=2)))
+    request_url = 'https://signin.' + amazon_domain + '.com/federation?'
+    logger.debug(request_url + URLENCODE(params))
+    response = URLOPEN(request_url + URLENCODE(params), context=ssl._create_unverified_context())
+    raw = response.read()
+
+    try:
+        token = json.loads(raw)['SigninToken']
+    except getattr(json.decoder, 'JSONDecoderError', ValueError):
+        token = json.loads(raw.decode())['SigninToken']
+    logger.debug('Signin token: {}'.format(token))
+    region = credentials.get('Region') or 'us-east-1'
+    logger.debug('Region: {}'.format(region))
+    params = {
+        'Action': 'login',
+        'Issuer': '',
+        'Destination': destination if is_url(destination) else 'https://console.' + amazon_domain + '.com/' + destination + '/home?region=' + region,
+        'SigninToken': token
+    }
+    logger.debug('URL params: {}'.format(json.dumps(params, default=str, indent=2)))
+    url = 'https://signin.' + amazon_domain + '.com/federation?'
+    url += URLENCODE(params)
+    return url
+
 
 
 def main():
@@ -35,10 +87,13 @@ def main():
     parser.add_argument('-v',
                         '--verbose',
                         action='store_true',
-                        help='an optional argument')    
+                        help='an optional argument')   
 
-    parser.add_argument('-r', '--role',  required=True,
-        help="role")            
+    parser.add_argument('--open',
+                        action='store_true',
+                        help='open browser')                            
+
+    parser.add_argument('-r', '--role', help="role")            
 
     args = parser.parse_args()
 
@@ -138,17 +193,41 @@ def main():
             if (attribute.get('Name') == 'https://aws.amazon.com/SAML/Attributes/Role'):
                 for value in attribute.iter(
                         '{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue'):
-                    if args.role in value.text:
-                        role_arn = value.text.split(',')[0]
-                        principal_arn = value.text.split(',')[1]
+                    if args.role:
+                        if args.role in value.text:
+                            role_arn = value.text.split(',')[0]
+                            principal_arn = value.text.split(',')[1]
+
 
                     aws_roles.append(value.text)
 
         
         if not role_arn:
             logger.warn("role not found")
-        else:
-            logger.info(f"STS assuming {role_arn}")
+
+            if len(aws_roles) > 1:
+                i = 0
+                print("Please choose the role you would like to assume:")
+                for awsrole in aws_roles:
+                    print('[{}]: {}'.format(i, awsrole.split(',')[0]))
+                    i += 1
+
+                selectedroleindex = input("Selection: ")
+
+                # Basic sanity check of input
+                if int(selectedroleindex) > (len(aws_roles) - 1):
+                    print('You selected an invalid role index, please try again')
+                    sys.exit(0)
+
+                role_arn = aws_roles[int(selectedroleindex)].split(',')[0]
+                principal_arn = aws_roles[int(selectedroleindex)].split(',')[1]
+
+            else:
+                # only one role not needed to choose
+                role_arn = aws_roles[0].split(',')[0]
+                principal_arn = aws_roles[0].split(',')[1]
+        
+        logger.info(f"STS assuming {role_arn}")
 
         response = boto3.client('sts').assume_role_with_saml(
             RoleArn=role_arn, 
@@ -157,13 +236,33 @@ def main():
             DurationSeconds=3600
         )["Credentials"]
 
-        print("export AWS_ACCESS_KEY_ID={}".format(response["AccessKeyId"]))
-        print("export AWS_SECRET_ACCESS_KEY={}".format(response["SecretAccessKey"]))
-        print("export AWS_SECURITY_TOKEN={}".format(response["SessionToken"]))
+        if args.open:
+            
+            url = get_console_url({
+                'AccessKeyId': response["AccessKeyId"],
+                'SecretAccessKey': response["SecretAccessKey"],
+                'SessionToken': response["SessionToken"],
+                'Region': "eu-central-1",
+            }, "ec2")
+
+
+            logger.debug('URL: {}'.format(url))
+
+
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                logger.error('Cannot open browser: {}'.format(e))
+                logger.error('Here is the link: {}'.format(url))
+        else:
+            print("export AWS_ACCESS_KEY_ID={}".format(response["AccessKeyId"]))
+            print("export AWS_SECRET_ACCESS_KEY={}".format(response["SecretAccessKey"]))
+            print("export AWS_SECURITY_TOKEN={}".format(response["SessionToken"]))
 
     else:
         print(" NO SAMLRequest ")
         sys.exit(1)
+
 
 
 if __name__ == '__main__':
