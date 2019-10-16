@@ -10,6 +10,7 @@ import keyring
 import argparse
 import logging
 import urllib
+import time
 import webbrowser
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
@@ -71,6 +72,9 @@ def get_console_url(credentials: dict = None, destination: str = None):
     return url
 
 
+def get_cfg(text):
+    result = re.search(r'\$Config=(.*);', text)
+    return json.loads(result.group(1))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -120,16 +124,14 @@ def main():
 
 
     r = s.get(main_url)
-    result = re.search(r'\$Config=(.*);', r.text)
-    start_saml = result.group(1)
-
-    start_saml_json = (json.loads(start_saml))
+    start_saml_json = get_cfg(r.text)
 
     # data to be sent to api 
     data = {start_saml_json["sFTName"]: start_saml_json["sFT"], 
             'ctx':start_saml_json["sCtx"], 
             "login": args.username,
             "passwd": passwd,
+
             } 
 
     headers = {
@@ -142,25 +144,90 @@ def main():
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/76.0.3809.100 Safari/537.36"
         }
+    
+    headers_j = {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/76.0.3809.100 Safari/537.36"
+        }
 
 
     url = login_url + "/common/login"
     logger.info(f"SAML POST1 to: {url} ")
     r1 = s.post(url ,headers=headers,data=data)
-    result = re.search(r'\$Config=(.*);', r1.text)
-    kmsi_saml = result.group(1)
-    kmsi_saml_json = (json.loads(kmsi_saml))
+
+    if "DeviceAuthTls/reprocess" in r1.text:
+
+        soup = BeautifulSoup(r1.text, 'html.parser')
+        url = soup.find('form', {'name': 'hiddenform'}).get('action')
+        logger.info(f"POST MFA to: {url} ")
+        data = {
+                "ctx" : soup.find('input', {'name': 'ctx'}).get('value'),
+                "flowToken": soup.find('input', {'name': 'flowtoken'}).get('value'),
+                }
+        r_mfa = s.post(url, headers=headers,data=data)
+        mfa_json = get_cfg(r_mfa.text)
 
 
+        url = mfa_json["urlBeginAuth"]
+        logger.info(f"POST SAS to: {url} ")
+        data = {
+                mfa_json["sFTName"]: mfa_json["sFT"], 
+                'ctx':mfa_json["sCtx"], 
+                "AuthMethodId": "PhoneAppNotification",
+                "Method": "BeginAuth",
+                }
+        r = s.post(url, headers=headers_j ,json=data)
+        bg = r.json()
+        
+        url = mfa_json["urlEndAuth"]
+        success = False
+        for x in range(30):
+            time.sleep(1)
+            data = {
+                "FlowToken": bg["FlowToken"], 
+                'Ctx': bg["Ctx"], 
+                "AuthMethodId": "PhoneAppNotification",
+                "Method": "EndAuth",
+                "PollCount": x,
+                "SessionId": bg["SessionId"]
+                }
+            
+             
+            r = s.post(url, headers=headers_j ,json=data).json()
+            if r["ResultValue"] == "Success":
+                print("success")
+                success = True
+                break
+            
+        if success:
+            data = {
+                "flowToken": r["FlowToken"], 
+                'request': bg["Ctx"], 
+                "mfaAuthMethod": "PhoneAppNotification"
+                }
+            url = mfa_json["urlPost"]   
+            logger.info(f"POST SAS EndAuth to: {url} ")     
+            r2 = s.post(url, headers=headers ,data=data)
 
-    url = login_url + kmsi_saml_json["urlPost"]
-    logger.info(f"POST KMSI to: {url} ")
-    kmsi_data = {
-            kmsi_saml_json["sFTName"]: kmsi_saml_json["sFT"], 
-            'ctx':kmsi_saml_json["sCtx"], 
-            }
-    r2 = s.post(url, headers=headers,data=kmsi_data)
+        else:
+            print("mfa error")
+            sys.exit(1)
 
+    
+    else:
+        kmsi_saml_json = get_cfg(r1.text)
+        
+        
+
+
+        url = kmsi_saml_json["urlPost"]
+        logger.info(f"POST KMSI to: {url} ")
+        kmsi_data = {
+                kmsi_saml_json["sFTName"]: kmsi_saml_json["sFT"], 
+                'ctx':kmsi_saml_json["sCtx"], 
+                }
+        r2 = s.post(url, headers=headers,data=kmsi_data)
+    
 
     soup = BeautifulSoup(r2.text, 'html.parser')
     url = soup.find('form', {'name': 'hiddenform'}).get('action')
@@ -180,13 +247,15 @@ def main():
         # print(r3.text)
         saml_request = re.search(r'(https:\/\/[a-zA-Z.\/\-]+)\/([a-zA-Z0-9\-]+)\/saml2\?SAMLRequest=([a-zA-Z0-9\-\%]+)', r3.text)
         url = saml_request.group(0)
-        tenant_id = saml_request.group(2)
+        # tenant_id = saml_request.group(2)
         logger.info(f"GET SAMLRequest")
         r5 = s.get(url)
 
         role_arn = None
         soup = BeautifulSoup(r5.text, 'html.parser')
         saml_response = soup.find('input', {'name': 'SAMLResponse'}).get('value')
+        logger.debug("SAML Response")
+        logger.debug(base64.b64decode(saml_response))
         aws_roles = []
         for attribute in ET.fromstring(base64.b64decode(saml_response)).iter(
                 '{urn:oasis:names:tc:SAML:2.0:assertion}Attribute'):
@@ -204,12 +273,18 @@ def main():
         
         if not role_arn:
             logger.warn("role not found")
+            alias = {}
+            if os.path.exists("alias.json"):
+                alias = json.load(open("alias.json", 'r'))
 
             if len(aws_roles) > 1:
                 i = 0
                 print("Please choose the role you would like to assume:")
                 for awsrole in aws_roles:
-                    print('[{}]: {}'.format(i, awsrole.split(',')[0]))
+                    account_id = awsrole.split(',')[0].split(":")[4]
+                    acc_alias = alias.get(account_id, "noalias")
+
+                    print('[{}]: {} - {}'.format(i, acc_alias, awsrole.split(',')[0]))
                     i += 1
 
                 selectedroleindex = input("Selection: ")
